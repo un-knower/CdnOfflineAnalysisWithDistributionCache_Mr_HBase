@@ -1,0 +1,315 @@
+package com.sohu.rdc.infcdn.offline.mr.driver;
+
+import com.sohu.rdc.infcdn.offline.mr.comOfDestIp.DestIpJob;
+import com.sohu.rdc.infcdn.offline.mr.comOfDestIp.DestIpMapper;
+import com.sohu.rdc.infcdn.offline.mr.comOfDestIp.DestIpReducer;
+import com.sohu.rdc.infcdn.offline.mr.comOfDomain.DomainJob;
+import com.sohu.rdc.infcdn.offline.mr.comOfDomain.DomainMapper;
+import com.sohu.rdc.infcdn.offline.mr.comOfDomain.DomainReducer;
+import com.sohu.rdc.infcdn.offline.mr.comOfEngine.EngineJob;
+import com.sohu.rdc.infcdn.offline.mr.comOfEngine.EngineMapper;
+import com.sohu.rdc.infcdn.offline.mr.comOfEngine.EngineReducer;
+import com.sohu.rdc.infcdn.offline.mr.comOfEngineDom.EngineDomJob;
+import com.sohu.rdc.infcdn.offline.mr.comOfEngineDom.EngineDomMapper;
+import com.sohu.rdc.infcdn.offline.mr.comOfEngineDom.EngineDomReducer;
+import com.sohu.rdc.infcdn.offline.mr.comOfServer.ServerJob;
+import com.sohu.rdc.infcdn.offline.mr.comOfServer.ServerMapper;
+import com.sohu.rdc.infcdn.offline.mr.comOfServer.ServerReducer;
+import com.sohu.rdc.infcdn.offline.mr.comOfServerDestIp.ServerDestIpJob;
+import com.sohu.rdc.infcdn.offline.mr.comOfServerDestIp.ServerDestIpMapper;
+import com.sohu.rdc.infcdn.offline.mr.comOfServerDestIp.ServerDestIpReducer;
+import com.sohu.rdc.infcdn.offline.mr.computePreFilter.CDNOfflineJob;
+import com.sohu.rdc.infcdn.offline.mr.resultEnginServer.TsServerDestipJob;
+import com.sohu.rdc.infcdn.offline.mr.resultEnginServer.TsServerDestipMapper;
+import com.sohu.rdc.infcdn.offline.mr.resultEnginServer.TsServerDestipReducer;
+import com.sohu.rdc.infcdn.offline.mr.resultEnginServerHbase.TsServerDestipHbJob;
+import com.sohu.rdc.infcdn.offline.mr.resultEnginServerHbase.TsServerDestipHbMapper;
+import com.sohu.rdc.infcdn.offline.mr.resultEnginServerHbase.TsServerDestipHbReducer;
+import com.sohu.rdc.infcdn.offline.test.HBaseWriteJob;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.mapreduce.TableMapReduceUtil;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.filecache.DistributedCache;
+import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.jobcontrol.ControlledJob;
+import org.apache.hadoop.mapreduce.lib.jobcontrol.JobControl;
+import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.GenericOptionsParser;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+
+/**
+ * Created by zhengyangliu on 2017/6/5.
+ */
+public class ProcessDriver {
+
+    private static final Logger LOG = LoggerFactory.getLogger(CDNOfflineJob.class);
+    //分布式缓存要存储的文件路径
+    private static String cachePath[] = {
+            "/user/xiaoliu/dbentity/dbrecord/part-r-00000",
+            "/user/xiaoliu/dbentity/dbBusiness_line/part-r-00000",
+            "/user/xiaoliu/dbentity/dbstaticCache/part-r-00000"
+    };
+    private static Configuration conf = new Configuration();
+    private static Configuration confOfHbase = HBaseConfiguration.create();
+
+
+    public static void main(String[] args) throws IOException, ClassNotFoundException, InterruptedException {
+
+        confOfHbase.addResource(new Path("file:///etc/hbase/conf/hbase-site.xml"));
+        String[] otherArgs = new GenericOptionsParser(conf, args).getRemainingArgs();
+        if (otherArgs.length < 2) {
+            System.err.println("Usage: CDNOfflineJob <input> <output>");
+            System.exit(2);
+        }
+
+
+        ControlledJob ctrljobPreFilter = getControlledJob("preFilter",
+                com.sohu.rdc.infcdn.offline.mr.computePreFilter.CDNOfflineJob.class,
+                com.sohu.rdc.infcdn.offline.mr.computePreFilter.CDNFilterMapper.class,
+                com.sohu.rdc.infcdn.offline.mr.computePreFilter.CDNComputeReducer.class);
+
+        for (int i = 0; i < otherArgs.length - 1; ++i) {
+            FileInputFormat.addInputPath(ctrljobPreFilter.getJob(), new Path(otherArgs[i]));
+        }
+        FileOutputFormat.setOutputPath(ctrljobPreFilter.getJob(),
+                new Path("outputchain"));
+
+
+        ControlledJob ctrljobEngineDom = getControlledJob("EngineDom", EngineJob.class, EngineMapper.class, EngineReducer.class);
+        ctrljobEngineDom.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobEngineDom.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobEngineDom.getJob(), new Path("outputmid1"));
+
+        ControlledJob ctrljobEngine = getControlledJob("Engine", EngineDomJob.class, EngineDomMapper.class, EngineDomReducer.class);
+        ctrljobEngine.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobEngine.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobEngine.getJob(), new Path("outputmid2"));
+
+        ControlledJob ctrljobDomain = getControlledJob("Domain", DomainJob.class, DomainMapper.class, DomainReducer.class);
+        ctrljobDomain.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobDomain.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobDomain.getJob(), new Path("outputmid3"));
+
+
+        ControlledJob ctrljobHbase = getControlledJobOfHbase("ctrljobHbase", "cdn:offline_etl_engineDom",TsServerDestipJob.class, TsServerDestipMapper.class, TsServerDestipReducer.class);
+
+        ctrljobHbase.addDependingJob(ctrljobEngineDom);
+        ctrljobHbase.addDependingJob(ctrljobEngine);
+        ctrljobHbase.addDependingJob(ctrljobDomain);
+        FileInputFormat.addInputPath(ctrljobHbase.getJob(), new Path("outputmid1"));     //？？？
+        FileInputFormat.addInputPath(ctrljobHbase.getJob(), new Path("outputmid2"));
+        FileInputFormat.addInputPath(ctrljobHbase.getJob(), new Path("outputmid3"));
+        // FileOutputFormat.setOutputPath(ctrljobDomain.getJob(), new Path("rdcinf:offline_cdn"));
+
+//维度2
+        ControlledJob ctrljobServerDestIp = getControlledJob("ServerDestIp", ServerDestIpJob.class, ServerDestIpMapper.class, ServerDestIpReducer.class);
+        ctrljobServerDestIp.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobServerDestIp.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobServerDestIp.getJob(), new Path("outputmid12"));
+
+        ControlledJob ctrljobServer = getControlledJob("Server", ServerJob.class, ServerMapper.class, ServerReducer.class);
+        ctrljobServer.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobServer.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobServer.getJob(), new Path("outputmid22"));
+
+        ControlledJob ctrljobDestIp = getControlledJob("DestIp", DestIpJob.class, DestIpMapper.class, DestIpReducer.class);
+        ctrljobDestIp.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobDestIp.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobDestIp.getJob(), new Path("outputmid32"));
+
+        ControlledJob ctrljobHbase2 = getControlledJobOfHbase("ctrljobHbase2", "cdn:offline_etl_serverDestIp", TsServerDestipHbJob.class, TsServerDestipHbMapper.class, TsServerDestipHbReducer.class);
+
+        ctrljobHbase2.addDependingJob(ctrljobServerDestIp);
+        ctrljobHbase2.addDependingJob(ctrljobServer);
+        ctrljobHbase2.addDependingJob(ctrljobDestIp);
+        FileInputFormat.addInputPath(ctrljobHbase2.getJob(), new Path("outputmid12"));
+        FileInputFormat.addInputPath(ctrljobHbase2.getJob(), new Path("outputmid22"));
+        FileInputFormat.addInputPath(ctrljobHbase2.getJob(), new Path("outputmid32"));
+        //hbase
+
+
+//维度3
+        ControlledJob ctrljobEng = getControlledJob("Eng",
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngine.CDNOfflineJob.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngine.CDNFilterMapper.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngine.CDNComputeReducer.class);
+        ctrljobEng.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobEng.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobEng.getJob(), new Path("outputmid13"));
+
+        ControlledJob ctrljobEngine_room2Engine = getControlledJob("Engine_room2Engine",
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngine_room2Engine.CDNOfflineJob.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngine_room2Engine.CDNFilterMapper.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngine_room2Engine.CDNComputeReducer.class);
+        ctrljobEngine_room2Engine.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobEngine_room2Engine.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobEngine_room2Engine.getJob(), new Path("outputmid23"));
+
+        ControlledJob ctrljobEngineRoom = getControlledJob("EngineRoom",
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngineRoom.CDNOfflineJob.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngineRoom.CDNFilterMapper.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngineRoom.CDNComputeReducer.class);
+        ctrljobEngineRoom.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobEngineRoom.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobEngineRoom.getJob(), new Path("outputmid33"));
+
+        ControlledJob ctrljobEngineTotal = getControlledJob("EngineTotal",
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngineTotal.CDNOfflineJob.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngineTotal.CDNFilterMapper.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfEngineTotal.CDNComputeReducer.class);
+        ctrljobEngineTotal.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobEngineTotal.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobEngineTotal.getJob(), new Path("outputmid43"));
+
+        ControlledJob ctrljobHbase3 = getControlledJobOfHbase("ctrljobHbase3", "cdn:cdn:offline_etl_Engine",
+                com.sohu.rdc.infcdn.offline.mr.resultOfEngineRoom.CDNResultToHBaseJob.class,
+                com.sohu.rdc.infcdn.offline.mr.resultOfEngineRoom.CombineKeyMapper.class,
+                com.sohu.rdc.infcdn.offline.mr.resultOfEngineRoom.HBaseTableReducer.class);
+        //hbase
+        ctrljobHbase3.addDependingJob(ctrljobEng);
+        ctrljobHbase3.addDependingJob(ctrljobEngine_room2Engine);
+        ctrljobHbase3.addDependingJob(ctrljobEngineRoom);
+        ctrljobHbase3.addDependingJob(ctrljobEngineTotal);
+        FileInputFormat.addInputPath(ctrljobHbase3.getJob(), new Path("outputmid13"));
+        FileInputFormat.addInputPath(ctrljobHbase3.getJob(), new Path("outputmid23"));
+        FileInputFormat.addInputPath(ctrljobHbase3.getJob(), new Path("outputmid33"));
+        FileInputFormat.addInputPath(ctrljobHbase3.getJob(), new Path("outputmid43"));
+
+
+//维度4
+        ControlledJob ctrlState = getControlledJob("State",
+                com.sohu.rdc.infcdn.offline.mr.computeOfState.CDNOfflineJob.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfState.CDNFilterMapper.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfState.CDNComputeReducer.class);
+        ctrlState.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrlState.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrlState.getJob(), new Path("outputmid14"));
+
+        ControlledJob ctrljobStateArea = getControlledJob("StateArea",
+                com.sohu.rdc.infcdn.offline.mr.computeOfStateArea.CDNOfflineJob.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfStateArea.CDNFilterMapper.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfStateArea.CDNComputeReducer.class);
+        ctrljobStateArea.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobStateArea.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobStateArea.getJob(), new Path("outputmid24"));
+
+        ControlledJob ctrljobStateBusiness = getControlledJob("StateBusiness",
+                com.sohu.rdc.infcdn.offline.mr.computeOfStateBusiness.CDNOfflineJob.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfStateBusiness.CDNFilterMapper.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfStateBusiness.CDNComputeReducer.class);
+        ctrljobStateBusiness.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobStateBusiness.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobStateBusiness.getJob(), new Path("outputmid34"));
+
+        ControlledJob ctrljobStateTotal = getControlledJob("StateTotal",
+                com.sohu.rdc.infcdn.offline.mr.computeOfStateTotal.CDNOfflineJob.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfStateTotal.CDNFilterMapper.class,
+                com.sohu.rdc.infcdn.offline.mr.computeOfStateTotal.CDNComputeReducer.class);
+        ctrljobStateTotal.addDependingJob(ctrljobPreFilter);
+        FileInputFormat.addInputPath(ctrljobStateTotal.getJob(), new Path("outputchain"));
+        FileOutputFormat.setOutputPath(ctrljobStateTotal.getJob(), new Path("outputmid44"));
+
+        ControlledJob ctrljobHbase4 = getControlledJobOfHbase("ctrljobHbase4", "cdn:offline_etl_state",
+                com.sohu.rdc.infcdn.offline.mr.result.CDNResultToHBaseJob.class,
+                com.sohu.rdc.infcdn.offline.mr.result.CombineKeyMapper.class,
+                com.sohu.rdc.infcdn.offline.mr.result.HBaseTableReducer.class);
+        //hbase
+        ctrljobHbase4.addDependingJob(ctrlState);
+        ctrljobHbase4.addDependingJob(ctrljobStateArea);
+        ctrljobHbase4.addDependingJob(ctrljobStateBusiness);
+        ctrljobHbase4.addDependingJob(ctrljobStateTotal);
+        FileInputFormat.addInputPath(ctrljobHbase4.getJob(), new Path("outputmid14"));
+        FileInputFormat.addInputPath(ctrljobHbase4.getJob(), new Path("outputmid24"));
+        FileInputFormat.addInputPath(ctrljobHbase4.getJob(), new Path("outputmid34"));
+        FileInputFormat.addInputPath(ctrljobHbase4.getJob(), new Path("outputmid44"));
+
+        JobControl jobCtrl = new JobControl("JobControl");
+        //添加到总的JobControl里，进行控制
+        jobCtrl.addJob(ctrljobPreFilter);
+        jobCtrl.addJob(ctrljobEngineDom);
+        jobCtrl.addJob(ctrljobEngine);
+        jobCtrl.addJob(ctrljobDomain);
+        jobCtrl.addJob(ctrljobHbase);
+        jobCtrl.addJob(ctrljobServerDestIp);
+        jobCtrl.addJob(ctrljobServer);
+        jobCtrl.addJob(ctrljobDestIp);
+        jobCtrl.addJob(ctrljobHbase2);
+        jobCtrl.addJob(ctrljobEng);
+        jobCtrl.addJob(ctrljobEngine_room2Engine);
+        jobCtrl.addJob(ctrljobEngineRoom);
+        jobCtrl.addJob(ctrljobEngineTotal);
+        jobCtrl.addJob(ctrljobHbase3);
+        jobCtrl.addJob(ctrlState);
+        jobCtrl.addJob(ctrljobStateArea);
+        jobCtrl.addJob(ctrljobStateBusiness);
+        jobCtrl.addJob(ctrljobStateTotal);
+        jobCtrl.addJob(ctrljobHbase4);
+
+        Thread t = new Thread(jobCtrl);
+        t.start();
+
+        while (true) {
+            if (jobCtrl.allFinished()) {//如果作业成功完成，就打印成功作业的信息
+                System.out.println(jobCtrl.getSuccessfulJobList());
+                jobCtrl.stop();
+                break;
+            }
+        }
+
+    }
+
+    private static ControlledJob getControlledJob(String jobName, Class<?> jobCls,
+                                                  Class<? extends org.apache.hadoop.mapreduce.Mapper> mapCls,
+                                                  Class<? extends org.apache.hadoop.mapreduce.Reducer> rdsCls) throws IOException {
+        Job job = new Job(conf, jobName);
+        job.setJarByClass(jobCls);
+        job.setMapperClass(mapCls);
+
+        job.setReducerClass(rdsCls);
+        job.setCombinerClass(rdsCls);
+
+        job.setOutputKeyClass(Text.class);
+        job.setOutputValueClass(Text.class);
+
+        job.setMapOutputKeyClass(Text.class);
+        job.setMapOutputValueClass(Text.class);
+
+
+        DistributedCache.addCacheFile(new Path(cachePath[0]).toUri(), job.getConfiguration());
+        DistributedCache.addCacheFile(new Path(cachePath[1]).toUri(), job.getConfiguration());
+        DistributedCache.addCacheFile(new Path(cachePath[2]).toUri(), job.getConfiguration());
+
+        ControlledJob ctrljob = new ControlledJob(conf);
+        ctrljob.setJob(job);
+        return ctrljob;
+    }
+
+
+    private static ControlledJob getControlledJobOfHbase(String jobName,String tableName, Class<?> jobCls,
+                                                  Class<? extends org.apache.hadoop.mapreduce.Mapper> mapCls,
+                                                  Class<? extends org.apache.hadoop.mapreduce.Reducer> rdsCls) throws IOException {
+        Job job = new Job(confOfHbase, jobName);
+        job.setJarByClass(jobCls);
+
+        TableMapReduceUtil.initTableReducerJob(
+                tableName,      // output table
+                HBaseWriteJob.MyTableReducer.class,             // reducer class
+                job);
+
+        job.setMapperClass(mapCls);
+        job.setReducerClass(rdsCls);
+
+        job.setMapOutputKeyClass(Text.class);
+        job.setMapOutputValueClass(Text.class);
+
+        ControlledJob ctrljob = new ControlledJob(conf);
+        ctrljob.setJob(job);
+        return ctrljob;
+    }
+}
